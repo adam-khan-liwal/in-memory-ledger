@@ -9,14 +9,8 @@ import (
 type EventType string
 
 const (
-	Credit        EventType = "CREDIT"
-	Debit         EventType = "DEBIT"
-	Authorization EventType = "AUTHORIZATION"
-	Settlement    EventType = "SETTLEMENT"
-	Reversal      EventType = "REVERSAL"
-	Fee           EventType = "FEE"
-	Interest      EventType = "INTEREST"
-	Accrual       EventType = "ACCRUAL"
+	Credit EventType = "CREDIT"
+	Debit  EventType = "DEBIT"
 )
 
 type Event struct {
@@ -32,11 +26,12 @@ type Event struct {
 }
 
 type Account struct {
-	ID         string
-	Currency   string
-	Precision  int
-	Multiplier int64
-	IsInternal bool // True for GL/accrual accounts
+	ID            string
+	Currency      string
+	Precision     int
+	Multiplier    int64
+	IsInternal    bool
+	NormalBalance string // "DEBIT" or "CREDIT"
 }
 
 type Ledger struct {
@@ -57,14 +52,15 @@ func NewLedger(startDate time.Time) *Ledger {
 	}
 }
 
-func (l *Ledger) AddAccount(id, currency string, precision int, isInternal bool) {
+func (l *Ledger) AddAccount(id, currency string, precision int, isInternal bool, normalBalance string) {
 	mult := int64(math.Pow10(precision))
 	l.Accounts[id] = &Account{
-		ID:         id,
-		Currency:   currency,
-		Precision:  precision,
-		Multiplier: mult,
-		IsInternal: isInternal,
+		ID:            id,
+		Currency:      currency,
+		Precision:     precision,
+		Multiplier:    mult,
+		IsInternal:    isInternal,
+		NormalBalance: normalBalance,
 	}
 	if !isInternal {
 		l.ActiveHolds[id] = make(map[string]int64)
@@ -82,27 +78,27 @@ func onOrBefore(t1, t2 time.Time) bool {
 	return t1.Before(t2) || t1.Equal(t2)
 }
 
+// LedgerBalanceAt calculates balance based on normal balance accounting rules:
+// - Asset / Expense (DEBIT normal): Debits - Credits
+// - Liability / Equity / Revenue (CREDIT normal): Credits - Debits
 func (l *Ledger) LedgerBalanceAt(accId string, asOf time.Time) int64 {
-	var balance int64 = 0
+	acc := l.Accounts[accId]
+	var debits int64 = 0
+	var credits int64 = 0
 	for _, e := range l.Events {
 		if e.AccountID == accId && onOrBefore(e.ValueDate, asOf) {
-			if e.Type == Credit || e.Type == Settlement || e.Type == Interest || e.Type == Accrual {
-				balance += e.Amount
-			} else if e.Type == Debit || e.Type == Fee {
-				balance -= e.Amount
-			} else if e.Type == Reversal {
-				targetevent := GetEvent(e.TargetEventID, l.Events)
-				if targetevent != nil {
-					if targetevent.Type == Debit || targetevent.Type == Fee {
-						balance += targetevent.Amount
-					} else {
-						balance -= targetevent.Amount
-					}
-				}
+			switch e.Type {
+			case Debit:
+				debits += e.Amount
+			case Credit:
+				credits += e.Amount
 			}
 		}
 	}
-	return balance
+	if acc.NormalBalance == "DEBIT" {
+		return debits - credits
+	}
+	return credits - debits
 }
 
 func GetEvent(id string, events []*Event) *Event {
@@ -123,34 +119,88 @@ func (l *Ledger) AvailableBalanceAt(accId string, asOf time.Time) int64 {
 	return balance - activeHolds
 }
 
+func (l *Ledger) postEntry(id string, processingDay, valueDate time.Time, t EventType, accID string, amount int64, currency string) {
+	l.Events = append(l.Events, &Event{
+		ID:            id,
+		ProcessingDay: processingDay,
+		ValueDate:     valueDate,
+		Type:          t,
+		AccountID:     accID,
+		Amount:        amount,
+		Currency:      currency,
+	})
+}
+
 func (l *Ledger) ProcessEvent(e *Event) error {
 	acc := l.Accounts[e.AccountID]
+	assetAccID := "GL-ASSET-CASH-" + e.Currency
 
 	switch e.Type {
-	case Authorization:
+	case "AUTHORIZATION":
 		avail := l.AvailableBalanceAt(acc.ID, e.ProcessingDay)
 		if avail-e.Amount < 0 {
 			return fmt.Errorf("authorization declined: insufficient available balance")
 		}
 		l.ActiveHolds[acc.ID][e.RefID] = e.Amount
-		l.Events = append(l.Events, e)
 
-	case Settlement:
+	case "SETTLEMENT":
 		delete(l.ActiveHolds[acc.ID], e.RefID)
-		l.Events = append(l.Events, e)
+		l.postEntry(e.ID+"-DR", e.ProcessingDay, e.ValueDate, Debit, acc.ID, e.Amount, e.Currency)
+		l.postEntry(e.ID+"-CR", e.ProcessingDay, e.ValueDate, Credit, assetAccID, e.Amount, e.Currency)
 
-	case Credit, Debit, Reversal, Accrual, Interest, Fee:
-		l.Events = append(l.Events, e)
+	case "CREDIT":
+		l.postEntry(e.ID+"-CR", e.ProcessingDay, e.ValueDate, Credit, acc.ID, e.Amount, e.Currency)
+		l.postEntry(e.ID+"-DR", e.ProcessingDay, e.ValueDate, Debit, assetAccID, e.Amount, e.Currency)
+
+	case "DEBIT":
+		l.postEntry(e.ID+"-DR", e.ProcessingDay, e.ValueDate, Debit, acc.ID, e.Amount, e.Currency)
+		l.postEntry(e.ID+"-CR", e.ProcessingDay, e.ValueDate, Credit, assetAccID, e.Amount, e.Currency)
+
+	case "FEE":
+		l.postEntry(e.ID+"-DR", e.ProcessingDay, e.ValueDate, Debit, acc.ID, e.Amount, e.Currency)
+		l.postEntry(e.ID+"-CR", e.ProcessingDay, e.ValueDate, Credit, assetAccID, e.Amount, e.Currency)
+
+	case "ACCRUAL":
+		expenseGL := "GL-INT-EXPENSE-" + acc.ID
+		payableGL := "GL-INT-PAYABLE-" + acc.ID
+		l.postEntry(e.ID+"-EXP-DR", e.ProcessingDay, e.ValueDate, Debit, expenseGL, e.Amount, e.Currency)
+		l.postEntry(e.ID+"-PAY-CR", e.ProcessingDay, e.ValueDate, Credit, payableGL, e.Amount, e.Currency)
+
+	case "INTEREST":
+		payableGL := "GL-INT-PAYABLE-" + acc.ID
+		l.postEntry(e.ID+"-PAY-DR", e.ProcessingDay, e.ValueDate, Debit, payableGL, e.Amount, e.Currency)
+		l.postEntry(e.ID+"-ACC-CR", e.ProcessingDay, e.ValueDate, Credit, acc.ID, e.Amount, e.Currency)
+
+	case "REVERSAL":
+		baseID := e.TargetEventID
+		drLeg := GetEvent(baseID+"-DR", l.Events)
+		crLeg := GetEvent(baseID+"-CR", l.Events)
+		if drLeg != nil {
+			revType := Credit
+			if drLeg.Type == Credit {
+				revType = Debit
+			}
+			l.postEntry(e.ID+"-"+drLeg.AccountID+"-REV", e.ProcessingDay, e.ValueDate, revType, drLeg.AccountID, drLeg.Amount, drLeg.Currency)
+		}
+		if crLeg != nil {
+			revType := Credit
+			if crLeg.Type == Credit {
+				revType = Debit
+			}
+			l.postEntry(e.ID+"-"+crLeg.AccountID+"-REV", e.ProcessingDay, e.ValueDate, revType, crLeg.AccountID, crLeg.Amount, crLeg.Currency)
+		}
 	}
-
 	return nil
 }
 
-// PrintLedgerState prints the entire snapshot of the ledger including internal GL accounts
 func (l *Ledger) PrintLedgerState(asOf time.Time) {
 	fmt.Println("    | --- LEDGER SNAPSHOT ---")
 
-	accIDs := []string{"ACC-001", "ACC-002", "GL-INT-PAYABLE-ACC-001"}
+	accIDs := []string{
+		"ACC-001", "ACC-002",
+		"GL-ASSET-CASH-AED", "GL-INT-PAYABLE-ACC-001", "GL-INT-EXPENSE-ACC-001",
+		"GL-ASSET-CASH-BHD", "GL-INT-PAYABLE-ACC-002", "GL-INT-EXPENSE-ACC-002",
+	}
 	for _, accId := range accIDs {
 		acc := l.Accounts[accId]
 		if acc == nil {
@@ -175,28 +225,83 @@ func (l *Ledger) PrintLedgerState(asOf time.Time) {
 	}
 	fmt.Println("    | -----------------------")
 }
+func (l *Ledger) PrintTrialBalance(asOf time.Time) {
+	fmt.Println("\n==========================================")
+	fmt.Println("             TRIAL BALANCE                ")
+	fmt.Println("==========================================")
+	fmt.Printf("%-30s | %-15s | %-15s\n", "Account ID", "Debit", "Credit")
+	fmt.Println("------------------------------------------------------------------")
 
+	var totalDebitsAED, totalCreditsAED int64
+	var totalDebitsBHD, totalCreditsBHD int64
+
+	// Sort or iterate through all accounts
+	for _, accId := range []string{
+		"ACC-001", "ACC-002",
+		"GL-ASSET-CASH-AED", "GL-ASSET-CASH-BHD",
+		"GL-INT-PAYABLE-ACC-001", "GL-INT-EXPENSE-ACC-001",
+		"GL-INT-PAYABLE-ACC-002", "GL-INT-EXPENSE-ACC-002",
+	} {
+		acc := l.Accounts[accId]
+		if acc == nil {
+			continue
+		}
+
+		ledgerBal := l.LedgerBalanceAt(accId, asOf)
+		if ledgerBal == 0 {
+			continue
+		}
+
+		var debitStr, creditStr string
+		if acc.NormalBalance == "DEBIT" {
+			if acc.Currency == "AED" {
+				totalDebitsAED += ledgerBal
+			} else {
+				totalDebitsBHD += ledgerBal
+			}
+			debitStr = l.formatAmount(accId, ledgerBal)
+			creditStr = "-"
+		} else {
+			if acc.Currency == "AED" {
+				totalCreditsAED += ledgerBal
+			} else {
+				totalCreditsBHD += ledgerBal
+			}
+			debitStr = "-"
+			creditStr = l.formatAmount(accId, ledgerBal)
+		}
+
+		fmt.Printf("%-30s | %-15s | %-15s\n", accId, debitStr, creditStr)
+	}
+
+	fmt.Println("------------------------------------------------------------------")
+	fmt.Println("--- AED Totals ---")
+	fmt.Printf("Total Debits:   AED %.2f\n", float64(totalDebitsAED)/100.0)
+	fmt.Printf("Total Credits:  AED %.2f\n", float64(totalCreditsAED)/100.0)
+
+	fmt.Println("--- BHD Totals ---")
+	fmt.Printf("Total Debits:   BHD %.3f\n", float64(totalDebitsBHD)/1000.0)
+	fmt.Printf("Total Credits:  BHD %.3f\n", float64(totalCreditsBHD)/1000.0)
+	fmt.Println("==========================================")
+}
 func (l *Ledger) EndOfDay(currentDay time.Time, isLastDay bool) {
 	fmt.Printf("\n>>> End of Day %s Processing <<<\n", currentDay.Format("2006-01-02"))
 
 	for _, acc := range l.Accounts {
 		if acc.IsInternal {
-			continue // Skip internal accounts for customer EOD rules
+			continue
 		}
 
-		// 1. Overdraft fee evaluations
+		// 1. Overdraft fee evaluations (AED only)
 		balance := l.LedgerBalanceAt(acc.ID, currentDay)
 		if balance < 0 && !l.FeesAssessed[acc.ID][currentDay] {
-			// for d := l.StartDate; onOrBefore(d, currentDay); d = d.AddDate(0, 0, 1) {
-			// balance := l.LedgerBalanceAt(acc.ID, d)
-			// if balance < 0 && !l.FeesAssessed[acc.ID][d] {
 			feeAmount := int64(25 * acc.Multiplier)
 			if acc.Currency == "AED" {
 				feeEvent := &Event{
 					ID:            fmt.Sprintf("FEE-%s-D%s", acc.ID, currentDay.Format("20060102")),
 					ProcessingDay: currentDay,
 					ValueDate:     currentDay,
-					Type:          Fee,
+					Type:          "FEE",
 					AccountID:     acc.ID,
 					Amount:        feeAmount,
 					Currency:      acc.Currency,
@@ -207,48 +312,50 @@ func (l *Ledger) EndOfDay(currentDay time.Time, isLastDay bool) {
 					l.formatAmount(acc.ID, feeAmount), currentDay.Format("2006-01-02"))
 				l.PrintLedgerState(currentDay)
 			}
-			// }
 		}
 
-		// 2. Daily Interest Accrual into Internal GL Account
+		// 2. Daily Interest Accrual
 		eodBalance := l.LedgerBalanceAt(acc.ID, currentDay)
 		if eodBalance > 0 {
 			exactAccrual := float64(eodBalance) * 0.0004
 			roundedAccrual := int64(math.Round(exactAccrual))
 			if roundedAccrual > 0 {
-				glAccID := "GL-INT-PAYABLE-" + acc.ID
+				payableGL := "GL-INT-PAYABLE-" + acc.ID
+				expenseGL := "GL-INT-EXPENSE-" + acc.ID
+
 				accrualEvent := &Event{
 					ID:            fmt.Sprintf("ACCRUAL-%s-%s", acc.ID, currentDay.Format("20060102")),
 					ProcessingDay: currentDay,
 					ValueDate:     currentDay,
-					Type:          Accrual,
-					AccountID:     glAccID,
+					Type:          "ACCRUAL",
+					AccountID:     acc.ID,
 					Amount:        roundedAccrual,
 					Currency:      acc.Currency,
 				}
 				l.ProcessEvent(accrualEvent)
-				fmt.Printf("Accrued Interest: %s stored in %s\n", l.formatAmount(acc.ID, roundedAccrual), glAccID)
+
+				fmt.Printf("Accrued Interest: %s (Expense Dr: %s, Payable Cr: %s)\n",
+					l.formatAmount(acc.ID, roundedAccrual), expenseGL, payableGL)
 				l.PrintLedgerState(currentDay)
 			}
 		}
 
 		// 3. Capitalize Interest on Final Day
 		if isLastDay {
-			glAccID := "GL-INT-PAYABLE-" + acc.ID
-			totalAccrued := l.LedgerBalanceAt(glAccID, currentDay)
+			payableGL := "GL-INT-PAYABLE-" + acc.ID
+			totalAccrued := l.LedgerBalanceAt(payableGL, currentDay)
 			if totalAccrued > 0 {
-				// Capitalization moves funds from GL Payable to Customer Account
-				interestEvent := &Event{
+				intEvent := &Event{
 					ID:            fmt.Sprintf("INT-%s", acc.ID),
 					ProcessingDay: currentDay,
 					ValueDate:     currentDay,
-					Type:          Interest,
+					Type:          "INTEREST",
 					AccountID:     acc.ID,
 					Amount:        totalAccrued,
 					Currency:      acc.Currency,
 				}
-				l.ProcessEvent(interestEvent)
-				fmt.Printf("Capitalized Interest: %s transferred from %s to %s\n", l.formatAmount(acc.ID, totalAccrued), glAccID, acc.ID)
+				l.ProcessEvent(intEvent)
+				fmt.Printf("Capitalized Interest: %s transferred from %s to %s\n", l.formatAmount(acc.ID, totalAccrued), payableGL, acc.ID)
 				l.PrintLedgerState(currentDay)
 			}
 		}
@@ -267,23 +374,31 @@ func main() {
 	}
 
 	l := NewLedger(days[0])
-	l.AddAccount("ACC-001", "AED", 2, false)
-	l.AddAccount("ACC-002", "BHD", 3, false)
-	l.AddAccount("GL-INT-PAYABLE-ACC-001", "AED", 2, true) // Internal GL account for tracking accrued liability
+
+	l.AddAccount("ACC-001", "AED", 2, false, "CREDIT")
+	l.AddAccount("ACC-002", "BHD", 3, false, "CREDIT")
+
+	l.AddAccount("GL-ASSET-CASH-AED", "AED", 2, true, "DEBIT")
+	l.AddAccount("GL-ASSET-CASH-BHD", "BHD", 3, true, "DEBIT")
+
+	l.AddAccount("GL-INT-PAYABLE-ACC-001", "AED", 2, true, "CREDIT")
+	l.AddAccount("GL-INT-EXPENSE-ACC-001", "AED", 2, true, "DEBIT")
+	l.AddAccount("GL-INT-PAYABLE-ACC-002", "BHD", 3, true, "CREDIT")
+	l.AddAccount("GL-INT-EXPENSE-ACC-002", "BHD", 3, true, "DEBIT")
 
 	stream := []*Event{
-		{ID: "E1", ProcessingDay: days[0], ValueDate: days[0], Type: Credit, AccountID: "ACC-001", Amount: 120000, Currency: "AED"},
-		{ID: "E2", ProcessingDay: days[0], ValueDate: days[0], Type: Debit, AccountID: "ACC-001", Amount: 95000, Currency: "AED"},
-		{ID: "E3", ProcessingDay: days[1], ValueDate: days[1], Type: Authorization, AccountID: "ACC-001", Amount: 20000, Currency: "AED", RefID: "Auth-A"},
-		{ID: "E4", ProcessingDay: days[2], ValueDate: days[2], Type: Credit, AccountID: "ACC-001", Amount: 40000, Currency: "AED"},
-		{ID: "E5", ProcessingDay: days[3], ValueDate: days[3], Type: Settlement, AccountID: "ACC-001", Amount: 18500, Currency: "AED", RefID: "Auth-A"},
-		{ID: "E6", ProcessingDay: days[3], ValueDate: days[3], Type: Settlement, AccountID: "ACC-001", Amount: 18000, Currency: "AED", RefID: "Auth-Z"},
-		{ID: "E7", ProcessingDay: days[4], ValueDate: days[1], Type: Debit, AccountID: "ACC-001", Amount: 62000, Currency: "AED"},
-		{ID: "E8", ProcessingDay: days[4], ValueDate: days[4], Type: Authorization, AccountID: "ACC-001", Amount: 9000, Currency: "AED", RefID: "Auth-B"},
-		{ID: "E9", ProcessingDay: days[5], ValueDate: days[1], Type: Reversal, AccountID: "ACC-001", TargetEventID: "E7", Currency: "AED"},
-		{ID: "E10-1", ProcessingDay: days[4], ValueDate: days[4], Type: Credit, AccountID: "ACC-002", Amount: 3334, Currency: "BHD"},
-		{ID: "E10-2", ProcessingDay: days[4], ValueDate: days[4], Type: Credit, AccountID: "ACC-002", Amount: 3333, Currency: "BHD"},
-		{ID: "E10-3", ProcessingDay: days[4], ValueDate: days[4], Type: Credit, AccountID: "ACC-002", Amount: 3333, Currency: "BHD"},
+		{ID: "E1", ProcessingDay: days[0], ValueDate: days[0], Type: "CREDIT", AccountID: "ACC-001", Amount: 120000, Currency: "AED"},
+		{ID: "E2", ProcessingDay: days[0], ValueDate: days[0], Type: "DEBIT", AccountID: "ACC-001", Amount: 95000, Currency: "AED"},
+		{ID: "E3", ProcessingDay: days[1], ValueDate: days[1], Type: "AUTHORIZATION", AccountID: "ACC-001", Amount: 20000, Currency: "AED", RefID: "Auth-A"},
+		{ID: "E4", ProcessingDay: days[2], ValueDate: days[2], Type: "CREDIT", AccountID: "ACC-001", Amount: 40000, Currency: "AED"},
+		{ID: "E5", ProcessingDay: days[3], ValueDate: days[3], Type: "SETTLEMENT", AccountID: "ACC-001", Amount: 18500, Currency: "AED", RefID: "Auth-A"},
+		{ID: "E6", ProcessingDay: days[3], ValueDate: days[3], Type: "SETTLEMENT", AccountID: "ACC-001", Amount: 18000, Currency: "AED", RefID: "Auth-Z"},
+		{ID: "E7", ProcessingDay: days[4], ValueDate: days[1], Type: "DEBIT", AccountID: "ACC-001", Amount: 62000, Currency: "AED"},
+		{ID: "E8", ProcessingDay: days[4], ValueDate: days[4], Type: "AUTHORIZATION", AccountID: "ACC-001", Amount: 9000, Currency: "AED", RefID: "Auth-B"},
+		{ID: "E9", ProcessingDay: days[5], ValueDate: days[1], Type: "REVERSAL", AccountID: "ACC-001", TargetEventID: "E7", Currency: "AED"},
+		{ID: "E10-1", ProcessingDay: days[4], ValueDate: days[4], Type: "CREDIT", AccountID: "ACC-002", Amount: 3334, Currency: "BHD"},
+		{ID: "E10-2", ProcessingDay: days[4], ValueDate: days[4], Type: "CREDIT", AccountID: "ACC-002", Amount: 3333, Currency: "BHD"},
+		{ID: "E10-3", ProcessingDay: days[4], ValueDate: days[4], Type: "CREDIT", AccountID: "ACC-002", Amount: 3333, Currency: "BHD"},
 	}
 
 	currentOpenDay := days[0]
@@ -293,21 +408,15 @@ func main() {
 	fmt.Printf("==========================================\n")
 
 	for _, e := range stream {
-		// 1. Check for late-arriving events (e.g., Day 5 event arriving while Day 6 is open)
 		if e.ProcessingDay.Before(currentOpenDay) {
-			fmt.Printf("\n[!] LATE EVENT DETECTED: %s (Adjusting Processing Day %s -> %s)\n",
-				e.ID, e.ProcessingDay.Format("2006-01-02"), currentOpenDay.Format("2006-01-02"))
 			e.ProcessingDay = currentOpenDay
 		}
 
-		// 2. Check for day advancement (close current day if the next event is for a future day)
 		for e.ProcessingDay.After(currentOpenDay) {
 			isLastDay := currentOpenDay.Equal(days[len(days)-1])
 			l.EndOfDay(currentOpenDay, isLastDay)
-
 			currentOpenDay = currentOpenDay.AddDate(0, 0, 1)
 
-			// Only print "STARTING DAY" if we are still within our 6-day window
 			if onOrBefore(currentOpenDay, days[len(days)-1]) {
 				fmt.Printf("\n==========================================\n")
 				fmt.Printf(" STARTING DAY: %s \n", currentOpenDay.Format("2006-01-02"))
@@ -315,36 +424,25 @@ func main() {
 			}
 		}
 
-		// 3. Process the event
 		err := l.ProcessEvent(e)
 		if err != nil {
 			fmt.Printf("\n[X] EVENT FAILED: %s (%v)\n", e.ID, err)
 		} else {
-			if e.Type == Reversal {
-				targetevent := GetEvent(e.TargetEventID, l.Events)
-				if targetevent != nil {
-					fmt.Printf("\n[+] PROCESSED EVENT: %s (%s %s -> %s %s) Value Date: %s\n", e.ID, e.Type, e.TargetEventID, targetevent.Type, l.formatAmount(targetevent.AccountID, targetevent.Amount), e.ValueDate.Format("2006-01-02"))
-				}
-			} else {
-				fmt.Printf("\n[+] PROCESSED EVENT: %s (%s %s %s %s) Value Date: %s\n", e.ID, e.Type, l.formatAmount(e.AccountID, e.Amount), e.RefID, e.TargetEventID, e.ValueDate.Format("2006-01-02"))
-			}
-			// Dump the full state immediately after processing the event
+			fmt.Printf("\n[+] PROCESSED EVENT: %s (%s %s)\n", e.ID, e.Type, l.formatAmount(e.AccountID, e.Amount))
 			l.PrintLedgerState(currentOpenDay)
 		}
 	}
 
-	// 4. Close any remaining days in the window (just in case the stream ended early)
 	for onOrBefore(currentOpenDay, days[len(days)-1]) {
 		isLastDay := currentOpenDay.Equal(days[len(days)-1])
 		l.EndOfDay(currentOpenDay, isLastDay)
-
 		if !isLastDay {
 			currentOpenDay = currentOpenDay.AddDate(0, 0, 1)
-			fmt.Printf("\n==========================================\n")
-			fmt.Printf(" STARTING DAY: %s \n", currentOpenDay.Format("2006-01-02"))
-			fmt.Printf("==========================================\n")
 		} else {
 			break
 		}
 	}
+
+	// Print final Balance Sheet Totals grouped by currency
+	l.PrintTrialBalance(days[len(days)-1])
 }
