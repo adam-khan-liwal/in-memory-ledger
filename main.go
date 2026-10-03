@@ -78,15 +78,26 @@ func onOrBefore(t1, t2 time.Time) bool {
 	return t1.Before(t2) || t1.Equal(t2)
 }
 
+func (l *Ledger) LedgerBalanceAt(accId string, asOf time.Time) int64 {
+	return l.LedgerBalanceAt1(accId, asOf, nil)
+}
+
 // LedgerBalanceAt calculates balance based on normal balance accounting rules:
 // - Asset / Expense (DEBIT normal): Debits - Credits
 // - Liability / Equity / Revenue (CREDIT normal): Credits - Debits
-func (l *Ledger) LedgerBalanceAt(accId string, asOf time.Time) int64 {
+func (l *Ledger) LedgerBalanceAt1(accId string, asOf time.Time, asOfProcessingDate *time.Time) int64 {
 	acc := l.Accounts[accId]
 	var debits int64 = 0
 	var credits int64 = 0
 	for _, e := range l.Events {
 		if e.AccountID == accId && onOrBefore(e.ValueDate, asOf) {
+			// fmt.Println(asOf)
+			// fmt.Println(acc.ID, e.Type, e.Amount)
+			if asOfProcessingDate != nil {
+				if !onOrBefore(e.ProcessingDay, *asOfProcessingDate) {
+					break
+				}
+			}
 			switch e.Type {
 			case Debit:
 				debits += e.Amount
@@ -443,6 +454,39 @@ func main() {
 		}
 	}
 
-	// Print final Balance Sheet Totals grouped by currency
 	l.PrintTrialBalance(days[len(days)-1])
+
+	l.PrintDailyBalances(days[:4], days[4])
+}
+
+func (l *Ledger) PrintDailyBalances(days []time.Time, asOfProcessingDate time.Time) {
+	fmt.Println("\n=====================================================================================================")
+	fmt.Printf("                   LEDGER BALANCES PER ACCOUNT PER DAY AS OF PROCESSING DATE %s               \n", asOfProcessingDate.Format("2006-01-02"))
+	fmt.Println("=====================================================================================================")
+
+	accIDs := []string{
+		"ACC-001", "ACC-002",
+		"GL-ASSET-CASH-AED", "GL-ASSET-CASH-BHD",
+		"GL-INT-PAYABLE-ACC-001", "GL-INT-EXPENSE-ACC-001",
+		"GL-INT-PAYABLE-ACC-002", "GL-INT-EXPENSE-ACC-002",
+	}
+
+	// Print Header
+	header := fmt.Sprintf("%-25s", "Account ID")
+	for _, d := range days {
+		header += fmt.Sprintf(" | %-12s", d.Format("2006-01-02"))
+	}
+	fmt.Println(header)
+	fmt.Println("-----------------------------------------------------------------------------------------------------")
+
+	// Print Row per Account
+	for _, accId := range accIDs {
+		row := fmt.Sprintf("%-25s", accId)
+		for _, d := range days {
+			bal := l.LedgerBalanceAt1(accId, d, &asOfProcessingDate)
+			row += fmt.Sprintf(" | %-12s", l.formatAmount(accId, bal))
+		}
+		fmt.Println(row)
+	}
+	fmt.Println("=====================================================================================================")
 }
