@@ -13,6 +13,9 @@ const (
 	Debit  EventType = "DEBIT"
 )
 
+const OVERDRAFT_FEE = 25
+const INTEREST_RATE = 0.0004
+
 type Event struct {
 	ID            string
 	ProcessingDay time.Time
@@ -169,7 +172,7 @@ func (l *Ledger) ProcessEvent(e *Event) error {
 
 	case "FEE":
 		l.postEntry(e.ID+"-DR", e.ProcessingDay, e.ValueDate, Debit, acc.ID, e.Amount, e.Currency)
-		l.postEntry(e.ID+"-CR", e.ProcessingDay, e.ValueDate, Credit, assetAccID, e.Amount, e.Currency)
+		l.postEntry(e.ID+"-CR", e.ProcessingDay, e.ValueDate, Credit, "GL-FEE-INCOME-"+e.Currency, e.Amount, e.Currency)
 
 	case "ACCRUAL":
 		expenseGL := "GL-INT-EXPENSE-" + acc.ID
@@ -250,6 +253,7 @@ func (l *Ledger) PrintTrialBalance(asOf time.Time) {
 	for _, accId := range []string{
 		"ACC-001", "ACC-002",
 		"GL-ASSET-CASH-AED", "GL-ASSET-CASH-BHD",
+		"GL-FEE-INCOME-AED", "GL-FEE-INCOME-BHD",
 		"GL-INT-PAYABLE-ACC-001", "GL-INT-EXPENSE-ACC-001",
 		"GL-INT-PAYABLE-ACC-002", "GL-INT-EXPENSE-ACC-002",
 	} {
@@ -306,7 +310,7 @@ func (l *Ledger) EndOfDay(currentDay time.Time, isLastDay bool) {
 		// 1. Overdraft fee evaluations (AED only)
 		balance := l.LedgerBalanceAt(acc.ID, currentDay)
 		if balance < 0 && !l.FeesAssessed[acc.ID][currentDay] {
-			feeAmount := int64(25 * acc.Multiplier)
+			feeAmount := int64(OVERDRAFT_FEE * acc.Multiplier)
 			if acc.Currency == "AED" {
 				feeEvent := &Event{
 					ID:            fmt.Sprintf("FEE-%s-D%s", acc.ID, currentDay.Format("20060102")),
@@ -328,7 +332,7 @@ func (l *Ledger) EndOfDay(currentDay time.Time, isLastDay bool) {
 		// 2. Daily Interest Accrual
 		eodBalance := l.LedgerBalanceAt(acc.ID, currentDay)
 		if eodBalance > 0 {
-			exactAccrual := float64(eodBalance) * 0.0004
+			exactAccrual := float64(eodBalance) * INTEREST_RATE
 			roundedAccrual := int64(math.Round(exactAccrual))
 			if roundedAccrual > 0 {
 				payableGL := "GL-INT-PAYABLE-" + acc.ID
@@ -392,6 +396,9 @@ func main() {
 	l.AddAccount("GL-ASSET-CASH-AED", "AED", 2, true, "DEBIT")
 	l.AddAccount("GL-ASSET-CASH-BHD", "BHD", 3, true, "DEBIT")
 
+	l.AddAccount("GL-FEE-INCOME-AED", "AED", 2, true, "CREDIT")
+	l.AddAccount("GL-FEE-INCOME-BHD", "BHD", 3, true, "CREDIT")
+
 	l.AddAccount("GL-INT-PAYABLE-ACC-001", "AED", 2, true, "CREDIT")
 	l.AddAccount("GL-INT-EXPENSE-ACC-001", "AED", 2, true, "DEBIT")
 	l.AddAccount("GL-INT-PAYABLE-ACC-002", "BHD", 3, true, "CREDIT")
@@ -413,17 +420,25 @@ func main() {
 	}
 
 	currentOpenDay := days[0]
+	recalculate := false
+	recalculate_from := currentOpenDay
 
 	fmt.Printf("\n==========================================\n")
 	fmt.Printf(" STARTING DAY: %s \n", currentOpenDay.Format("2006-01-02"))
 	fmt.Printf("==========================================\n")
 
 	for _, e := range stream {
-		if e.ProcessingDay.Before(currentOpenDay) {
-			e.ProcessingDay = currentOpenDay
-		}
+		// if e.ProcessingDay.Before(currentOpenDay) {
+		// 	e.ProcessingDay = currentOpenDay
+		// }
 
 		for e.ProcessingDay.After(currentOpenDay) {
+
+			fmt.Println("recalculate", recalculate, "from", recalculate_from)
+			if recalculate {
+				l.RecalculateFrom(recalculate_from, currentOpenDay)
+			}
+
 			isLastDay := currentOpenDay.Equal(days[len(days)-1])
 			l.EndOfDay(currentOpenDay, isLastDay)
 			currentOpenDay = currentOpenDay.AddDate(0, 0, 1)
@@ -432,19 +447,37 @@ func main() {
 				fmt.Printf("\n==========================================\n")
 				fmt.Printf(" STARTING DAY: %s \n", currentOpenDay.Format("2006-01-02"))
 				fmt.Printf("==========================================\n")
+
+				recalculate = false
+				recalculate_from = currentOpenDay
 			}
 		}
 
 		err := l.ProcessEvent(e)
+
 		if err != nil {
 			fmt.Printf("\n[X] EVENT FAILED: %s (%v)\n", e.ID, err)
 		} else {
 			fmt.Printf("\n[+] PROCESSED EVENT: %s (%s %s)\n", e.ID, e.Type, l.formatAmount(e.AccountID, e.Amount))
+
+			if e.ValueDate.Before(currentOpenDay) {
+				fmt.Println("BACKDATED ENTRY, WILL RECALCULATE AT END OF DAY")
+				recalculate = true
+				if e.ValueDate.Before(recalculate_from) {
+					recalculate_from = e.ValueDate
+				}
+			}
+
 			l.PrintLedgerState(currentOpenDay)
+
 		}
 	}
 
 	for onOrBefore(currentOpenDay, days[len(days)-1]) {
+		if recalculate {
+			l.RecalculateFrom(recalculate_from, currentOpenDay)
+		}
+
 		isLastDay := currentOpenDay.Equal(days[len(days)-1])
 		l.EndOfDay(currentOpenDay, isLastDay)
 		if !isLastDay {
@@ -456,7 +489,7 @@ func main() {
 
 	l.PrintTrialBalance(days[len(days)-1])
 
-	l.PrintDailyBalances(days[:4], days[4])
+	// l.PrintDailyBalances(days[:4], days[4])
 }
 
 func (l *Ledger) PrintDailyBalances(days []time.Time, asOfProcessingDate time.Time) {
@@ -489,4 +522,118 @@ func (l *Ledger) PrintDailyBalances(days []time.Time, asOfProcessingDate time.Ti
 		fmt.Println(row)
 	}
 	fmt.Println("=====================================================================================================")
+}
+
+// RecalculateFrom reruns fees and interest accruals from backDate up to currentOpenDay,
+// checking the GL accounts (GL-FEE-INCOME and GL-INT-PAYABLE) for existing entries on each value date,
+// and inserts delta adjustment entries if discrepancies are found.
+func (l *Ledger) RecalculateFrom(backDate, currentOpenDay time.Time) {
+	fmt.Printf("\n--- RECALCULATING FEES & ACCRUALS FROM %s TO %s ---\n",
+		backDate.Format("2006-01-02"), currentOpenDay.Format("2006-01-02"))
+
+	d := backDate
+	for d.Before(currentOpenDay) {
+		for _, acc := range l.Accounts {
+			if acc.IsInternal {
+				continue
+			}
+
+			// Define corresponding GL account IDs
+			feeIncomeGL := "GL-FEE-INCOME-" + acc.Currency
+			payableGL := "GL-INT-PAYABLE-" + acc.ID
+
+			// 1. Check existing recorded fee via GL-FEE-INCOME entries on value date 'd'
+			var recordedFee int64 = 0
+			for _, ev := range l.Events {
+				if ev.AccountID == feeIncomeGL && ev.ValueDate.Equal(d) {
+					switch ev.Type {
+					case Credit:
+						recordedFee += ev.Amount
+					case Debit:
+						recordedFee -= ev.Amount
+					}
+				}
+			}
+
+			// 2. Check existing recorded accrual via GL-INT-PAYABLE entries on value date 'd'
+			var recordedAccrual int64 = 0
+			for _, ev := range l.Events {
+				if ev.AccountID == payableGL && ev.ValueDate.Equal(d) {
+					switch ev.Type {
+					case Credit:
+						recordedAccrual += ev.Amount
+					case Debit:
+						recordedAccrual -= ev.Amount
+					}
+				}
+			}
+
+			// 3. Calculate expected fees on value date 'd'
+			balance := l.LedgerBalanceAt(acc.ID, d)
+			var expectedFee int64 = 0
+			if balance < 0 && acc.Currency == "AED" {
+				expectedFee = int64(OVERDRAFT_FEE * acc.Multiplier)
+			}
+
+			// If expected fee differs from recorded fee in GL, post the delta
+			if expectedFee != recordedFee {
+				feeDelta := expectedFee - recordedFee
+				if feeDelta != 0 {
+					feeEvent := &Event{
+						ID:            fmt.Sprintf("FEE-DELTA-%s-D%s", acc.ID, d.Format("20060102")),
+						ProcessingDay: currentOpenDay,
+						ValueDate:     d,
+						Type:          "FEE",
+						AccountID:     acc.ID,
+						Amount:        feeDelta,
+						Currency:      acc.Currency,
+					}
+					l.ProcessEvent(feeEvent)
+					fmt.Printf("[RECALC] Inserted Fee Delta: %s for Value Date %s (Expected: %s, Recorded in GL: %s)\n",
+						l.formatAmount(acc.ID, feeDelta), d.Format("2006-01-02"), l.formatAmount(acc.ID, expectedFee), l.formatAmount(acc.ID, recordedFee))
+				}
+			}
+
+			// 4. Calculate expected accruals on value date 'd'
+			eodBalance := l.LedgerBalanceAt(acc.ID, d)
+			var expectedAccrual int64 = 0
+			if eodBalance > 0 {
+				expectedAccrual = int64(math.Round(float64(eodBalance) * INTEREST_RATE))
+			}
+
+			// If expected accrual differs from recorded accrual in GL, post the delta
+			if expectedAccrual != recordedAccrual {
+				accrualDelta := expectedAccrual - recordedAccrual
+				if accrualDelta != 0 {
+					accrualEvent := &Event{
+						ID:            fmt.Sprintf("ACCRUAL-DELTA-%s-%s", acc.ID, d.Format("20060102")),
+						ProcessingDay: currentOpenDay,
+						ValueDate:     d,
+						Type:          "ACCRUAL",
+						AccountID:     acc.ID,
+						Amount:        accrualDelta,
+						Currency:      acc.Currency,
+					}
+					l.ProcessEvent(accrualEvent)
+					fmt.Printf("[RECALC] Inserted Accrual Delta: %s for Value Date %s (Balance: %s, Expected: %s, Recorded in GL: %s)\n",
+						l.formatAmount(acc.ID, accrualDelta), d.Format("2006-01-02"), l.formatAmount(payableGL, eodBalance), l.formatAmount(payableGL, expectedAccrual), l.formatAmount(payableGL, recordedAccrual))
+				}
+			}
+		}
+		d = d.AddDate(0, 0, 1)
+	}
+}
+
+// GetEntriesForDate returns all events affecting a specific account on a given date
+func (l *Ledger) GetEntriesForDate(accId string, targetDate time.Time) []*Event {
+	var matchedEvents []*Event
+	for _, e := range l.Events {
+		if e.AccountID == accId {
+			// Check if either ProcessingDay or ValueDate matches the target date
+			if e.ValueDate.Equal(targetDate) {
+				matchedEvents = append(matchedEvents, e)
+			}
+		}
+	}
+	return matchedEvents
 }
