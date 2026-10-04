@@ -7,25 +7,29 @@ import (
 )
 
 type EventType string
+type TransactionType string
 
 const (
-	Credit EventType = "CREDIT"
-	Debit  EventType = "DEBIT"
+	Credit TransactionType = "CREDIT"
+	Debit  TransactionType = "DEBIT"
+
+	FEE EventType = "FEE"
 )
 
 const OVERDRAFT_FEE = 25
 const INTEREST_RATE = 0.0004
 
 type Event struct {
-	ID            string
-	ProcessingDay time.Time
-	ValueDate     time.Time
-	Type          EventType
-	AccountID     string
-	Amount        int64
-	Currency      string
-	RefID         string
-	TargetEventID string
+	ID              string
+	ProcessingDay   time.Time
+	ValueDate       time.Time
+	TransactionType TransactionType
+	Type            EventType
+	AccountID       string
+	Amount          int64
+	Currency        string
+	RefID           string
+	TargetEventID   string
 }
 
 type Account struct {
@@ -82,26 +86,33 @@ func onOrBefore(t1, t2 time.Time) bool {
 }
 
 func (l *Ledger) LedgerBalanceAt(accId string, asOf time.Time) int64 {
-	return l.LedgerBalanceAt1(accId, asOf, nil)
+	return l.LedgerBalanceAt1(accId, asOf, nil, false)
 }
 
 // LedgerBalanceAt calculates balance based on normal balance accounting rules:
 // - Asset / Expense (DEBIT normal): Debits - Credits
 // - Liability / Equity / Revenue (CREDIT normal): Credits - Debits
-func (l *Ledger) LedgerBalanceAt1(accId string, asOf time.Time, asOfProcessingDate *time.Time) int64 {
+func (l *Ledger) LedgerBalanceAt1(accId string, asOf time.Time, asOfProcessingDate *time.Time, before_fees bool) int64 {
 	acc := l.Accounts[accId]
 	var debits int64 = 0
 	var credits int64 = 0
 	for _, e := range l.Events {
 		if e.AccountID == accId && onOrBefore(e.ValueDate, asOf) {
-			// fmt.Println(asOf)
-			// fmt.Println(acc.ID, e.Type, e.Amount)
+
+			// fmt.Println(asOf, acc.ID, e.Type, e.Amount)
+
+			if before_fees {
+				if e.Type == FEE {
+					continue
+				}
+			}
+
 			if asOfProcessingDate != nil {
 				if !onOrBefore(e.ProcessingDay, *asOfProcessingDate) {
 					break
 				}
 			}
-			switch e.Type {
+			switch e.TransactionType {
 			case Debit:
 				debits += e.Amount
 			case Credit:
@@ -133,15 +144,20 @@ func (l *Ledger) AvailableBalanceAt(accId string, asOf time.Time) int64 {
 	return balance - activeHolds
 }
 
-func (l *Ledger) postEntry(id string, processingDay, valueDate time.Time, t EventType, accID string, amount int64, currency string) {
+func (l *Ledger) postEntry(id string, processingDay, valueDate time.Time, t TransactionType, accID string, amount int64, currency string) {
+	l.postEntry1(id, processingDay, valueDate, t, accID, amount, currency, "")
+}
+
+func (l *Ledger) postEntry1(id string, processingDay, valueDate time.Time, t TransactionType, accID string, amount int64, currency string, e EventType) {
 	l.Events = append(l.Events, &Event{
-		ID:            id,
-		ProcessingDay: processingDay,
-		ValueDate:     valueDate,
-		Type:          t,
-		AccountID:     accID,
-		Amount:        amount,
-		Currency:      currency,
+		ID:              id,
+		ProcessingDay:   processingDay,
+		ValueDate:       valueDate,
+		TransactionType: t,
+		Type:            e,
+		AccountID:       accID,
+		Amount:          amount,
+		Currency:        currency,
 	})
 }
 
@@ -170,8 +186,8 @@ func (l *Ledger) ProcessEvent(e *Event) error {
 		l.postEntry(e.ID+"-DR", e.ProcessingDay, e.ValueDate, Debit, acc.ID, e.Amount, e.Currency)
 		l.postEntry(e.ID+"-CR", e.ProcessingDay, e.ValueDate, Credit, assetAccID, e.Amount, e.Currency)
 
-	case "FEE":
-		l.postEntry(e.ID+"-DR", e.ProcessingDay, e.ValueDate, Debit, acc.ID, e.Amount, e.Currency)
+	case FEE:
+		l.postEntry1(e.ID+"-DR", e.ProcessingDay, e.ValueDate, Debit, acc.ID, e.Amount, e.Currency, FEE)
 		l.postEntry(e.ID+"-CR", e.ProcessingDay, e.ValueDate, Credit, "GL-FEE-INCOME-"+e.Currency, e.Amount, e.Currency)
 
 	case "ACCRUAL":
@@ -191,14 +207,14 @@ func (l *Ledger) ProcessEvent(e *Event) error {
 		crLeg := GetEvent(baseID+"-CR", l.Events)
 		if drLeg != nil {
 			revType := Credit
-			if drLeg.Type == Credit {
+			if drLeg.TransactionType == Credit {
 				revType = Debit
 			}
 			l.postEntry(e.ID+"-"+drLeg.AccountID+"-REV", e.ProcessingDay, e.ValueDate, revType, drLeg.AccountID, drLeg.Amount, drLeg.Currency)
 		}
 		if crLeg != nil {
 			revType := Credit
-			if crLeg.Type == Credit {
+			if crLeg.TransactionType == Credit {
 				revType = Debit
 			}
 			l.postEntry(e.ID+"-"+crLeg.AccountID+"-REV", e.ProcessingDay, e.ValueDate, revType, crLeg.AccountID, crLeg.Amount, crLeg.Currency)
@@ -212,6 +228,7 @@ func (l *Ledger) PrintLedgerState(asOf time.Time) {
 
 	accIDs := []string{
 		"ACC-001", "ACC-002",
+		"GL-FEE-INCOME-AED", "GL-FEE-INCOME-BHD",
 		"GL-ASSET-CASH-AED", "GL-INT-PAYABLE-ACC-001", "GL-INT-EXPENSE-ACC-001",
 		"GL-ASSET-CASH-BHD", "GL-INT-PAYABLE-ACC-002", "GL-INT-EXPENSE-ACC-002",
 	}
@@ -316,7 +333,7 @@ func (l *Ledger) EndOfDay(currentDay time.Time, isLastDay bool) {
 					ID:            fmt.Sprintf("FEE-%s-D%s", acc.ID, currentDay.Format("20060102")),
 					ProcessingDay: currentDay,
 					ValueDate:     currentDay,
-					Type:          "FEE",
+					Type:          FEE,
 					AccountID:     acc.ID,
 					Amount:        feeAmount,
 					Currency:      acc.Currency,
@@ -494,7 +511,7 @@ func main() {
 
 func (l *Ledger) PrintDailyBalances(days []time.Time, asOfProcessingDate time.Time) {
 	fmt.Println("\n=====================================================================================================")
-	fmt.Printf("                   LEDGER BALANCES PER ACCOUNT PER DAY AS OF PROCESSING DATE %s               \n", asOfProcessingDate.Format("2006-01-02"))
+	fmt.Printf("          LEDGER BALANCES BEFORE FEES PER ACCOUNT PER DAY AS OF PROCESSING DATE %s               \n", asOfProcessingDate.Format("2006-01-02"))
 	fmt.Println("=====================================================================================================")
 
 	accIDs := []string{
@@ -516,7 +533,7 @@ func (l *Ledger) PrintDailyBalances(days []time.Time, asOfProcessingDate time.Ti
 	for _, accId := range accIDs {
 		row := fmt.Sprintf("%-25s", accId)
 		for _, d := range days {
-			bal := l.LedgerBalanceAt1(accId, d, &asOfProcessingDate)
+			bal := l.LedgerBalanceAt1(accId, d, &asOfProcessingDate, true)
 			row += fmt.Sprintf(" | %-12s", l.formatAmount(accId, bal))
 		}
 		fmt.Println(row)
@@ -546,7 +563,7 @@ func (l *Ledger) RecalculateFrom(backDate, currentOpenDay time.Time) {
 			var recordedFee int64 = 0
 			for _, ev := range l.Events {
 				if ev.AccountID == feeIncomeGL && ev.ValueDate.Equal(d) {
-					switch ev.Type {
+					switch ev.TransactionType {
 					case Credit:
 						recordedFee += ev.Amount
 					case Debit:
@@ -559,7 +576,7 @@ func (l *Ledger) RecalculateFrom(backDate, currentOpenDay time.Time) {
 			var recordedAccrual int64 = 0
 			for _, ev := range l.Events {
 				if ev.AccountID == payableGL && ev.ValueDate.Equal(d) {
-					switch ev.Type {
+					switch ev.TransactionType {
 					case Credit:
 						recordedAccrual += ev.Amount
 					case Debit:
@@ -583,7 +600,7 @@ func (l *Ledger) RecalculateFrom(backDate, currentOpenDay time.Time) {
 						ID:            fmt.Sprintf("FEE-DELTA-%s-D%s", acc.ID, d.Format("20060102")),
 						ProcessingDay: currentOpenDay,
 						ValueDate:     d,
-						Type:          "FEE",
+						Type:          FEE,
 						AccountID:     acc.ID,
 						Amount:        feeDelta,
 						Currency:      acc.Currency,
@@ -621,7 +638,9 @@ func (l *Ledger) RecalculateFrom(backDate, currentOpenDay time.Time) {
 			}
 		}
 		d = d.AddDate(0, 0, 1)
+
 	}
+	l.PrintLedgerState(currentOpenDay)
 }
 
 // GetEntriesForDate returns all events affecting a specific account on a given date
